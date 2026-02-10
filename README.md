@@ -1,4 +1,4 @@
-> [!IMPORTANT]
+> [!CAUTION]
 > This project is now deprecated.
 
 # NoSteamWebHelper
@@ -46,5 +46,6 @@ This way, Steam is still accessible to use.
 
 
 3. Start MSYS2's `UCRT64` environment & run `Build.cmd`.
+
 
 
