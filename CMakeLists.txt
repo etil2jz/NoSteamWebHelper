@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.10)
 project(NoSteamWebHelper C)
 
 add_library(umpdc SHARED src/Library.c)
+set_target_properties(umpdc PROPERTIES PREFIX "")
 
 # Extreme size optimization & no stdlib
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
