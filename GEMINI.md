@@ -1,38 +1,46 @@
-# NoSteamWebHelper
+# NoSteamWebHelper - Instructions & Context
 
 ## Project Overview
-NoSteamWebHelper is a (now deprecated) C-based utility designed to disable Steam's CEF (Chromium Embedded Framework) / Steam WebHelper when a game is running. It was created to replace the removed `-no-browser` command-line parameter in Steam. The project builds a dynamic link library (`umpdc.dll`) that checks if an app is running and toggles the CEF accordingly, allowing Steam to be accessible while freeing system resources during gameplay.
+NoSteamWebHelper is a high-performance Win32 utility (C-based) that dynamically disables Steam's Chromium Embedded Framework (CEF) / WebHelper when a game is running. It aims to replace the removed `-no-browser` flag, freeing system resources while keeping Steam functional.
 
-## Architecture & Mechanics
-- **Language**: C (Win32 API)
-- **Main Source**: `src/Library.c`
-- **Output**: `bin/umpdc.dll`
-- **Core Logic**:
-  - Injected via DLL load order (placing `umpdc.dll` next to `steam.exe`).
-  - Uses `SetWinEventHook` to detect `vguiPopupWindow` creations.
-  - Monitors the `HKEY_CURRENT_USER\SOFTWARE\Valve\Steam\RunningAppID` registry key to check if an app is running.
-  - Terminates `steamwebhelper.exe` processes spawned by the current process using `WTSEnumerateProcessesW` and `NtQueryInformationProcess`.
-  - Creates a system tray icon (`Shell_NotifyIconW`) with a context menu to manually toggle the behavior by overriding the `RunningAppID` registry value.
+### Architecture
+- **Language**: Pure C (Win32 API), optimized for binary size (`nostdlib`).
+- **Core Component**: `umpdc.dll`, designed to be loaded via DLL side-loading/injection (placed next to `steam.exe`).
+- **Mechanics**:
+  - **Event Hooking**: Uses `SetWinEventHook` to detect Steam window creations.
+  - **Registry Monitoring**: Asynchronously monitors `HKCU\SOFTWARE\Valve\Steam\RunningAppID` to detect game state changes.
+  - **Process Management**: Uses `Toolhelp32` snapshotting to identify and terminate `steamwebhelper.exe` processes spawned by Steam.
+  - **Thread Safety**: Employs `Interlocked` atomic operations for race-condition-free initialization of the monitoring thread.
+  - **UI**: Provides a minimalist system tray icon for manual toggling and status feedback.
 
-## Building and Running
-The project is built using MSYS2 and the MinGW-w64 toolchain.
+## Building and Pipeline
+The project uses a modern CMake-based build system optimized for size and performance.
 
-1. **Prerequisites**: Install MSYS2 and update it. Then, install the UCRT64 GCC toolchain:
-   ```bash
-   pacman -Syu --noconfirm
-   pacman -Syu mingw-w64-ucrt-x86_64-gcc --noconfirm
-   ```
-2. **Build Command**: Start the MSYS2 `UCRT64` environment and run the provided build script from the project root:
-   ```cmd
-   Build.cmd
-   ```
-   This script compiles `src/Library.c` and outputs the resulting binary to `bin/umpdc.dll`.
-3. **Usage/Installation**:
-   - Place the compiled `umpdc.dll` in your Steam installation directory where `steam.exe` is located.
-   - Make sure Steam is fully closed and launch a new instance of Steam.
-   - Start an app to see the CEF toggled automatically.
-   - *(Note: Launch Steam with the `-silent` flag to prevent the CEF from automatically showing when restored.)*
+### Build Requirements
+- **MSYS2** (UCRT64 environment)
+- **LLVM/Clang** (preferred) or GCC
+- **CMake** & **Ninja**
+
+### Compilation Commands
+```bash
+# Configuration for maximum size optimization
+cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_BUILD_TYPE=MinSizeRel
+
+# Build
+cmake --build build
+```
+Output binary: `build/umpdc.dll`
+
+### CI/CD Pipeline
+- **Platform**: GitHub Actions (`.github/workflows/release.yml`)
+- **Features**:
+  - **Validation**: Compiles the project on every Pull Request to `main`.
+  - **Deployment**: On version tags (`v*`), performs a production build using **LLVM/Clang 22**.
+  - **Immutability & Trust**: Generates **GitHub Artifact Attestations** (SLSA) for every release, ensuring cryptographic proof of provenance.
 
 ## Development Conventions
-- **Toolchain & Flags**: The `Build.cmd` script is heavily optimized for binary size. It uses size optimization (`-Oz`), gc-sections (`-Wl,--gc-sections`), removes symbols (`-Wl,--exclude-all-symbols`, `-s`), and omits the standard library (`-nostdlib`).
-- **Coding Style**: The C codebase uses native Windows API calls (e.g., `ntdll`, `wtsapi32`, `kernel32`, `user32`, `advapi32`, `shell32`) and relies on Windows-specific types. It employs succinct inline type casting and compound literals (e.g., `&((DWORD){sizeof(BOOL)})`) characteristic of low-level systems programming.
+- **Minimalism**: Avoid C Standard Library (`nostdlib`). Use direct Win32/NT APIs.
+- **Size Optimization**: Use aggressive compiler flags (`-Oz`, `-fno-stack-protector`, `-fno-asynchronous-unwind-tables`).
+- **Nomenclature**: Use descriptive constants (defined in `Library.c`) instead of magic strings or numbers.
+- **Safety**: Always close Handles and use atomic operations when managing shared state between the Main thread and the Registry Monitor thread.
+- **Provenance**: All production binaries must be built through the CI pipeline to maintain "Immutable" status.
