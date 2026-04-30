@@ -18,7 +18,7 @@ This project has been fully refactored for maximum performance and reliability:
 - **Immutable Releases**: Automated CI/CD pipeline via GitHub Actions with cryptographic build provenance (SLSA).
 
 ## Usage
-1. Download the latest release from [GitHub Releases](https://github.com/Aetopia/NoSteamWebHelper/releases).
+1. Download the latest release from [GitHub Releases](https://github.com/etil2jz/NoSteamWebHelper/releases/latest).
 2. Place `umpdc.dll` in your Steam installation directory (same folder as `steam.exe`).
 3. Ensure Steam is fully closed, then launch Steam.
 4. The CEF will now toggle automatically when you launch/close a game.
