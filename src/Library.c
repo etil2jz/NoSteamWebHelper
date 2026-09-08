@@ -1,20 +1,38 @@
 #include <windows.h>
 #include <tlhelp32.h>
+#include <psapi.h>
+#include "config.h"
 
 #define STEAM_REGISTRY_KEY L"SOFTWARE\\Valve\\Steam"
 #define RUNNING_APP_ID_VALUE L"RunningAppID"
 #define STEAM_WEB_HELPER_EXE L"steamwebhelper.exe"
 #define VGUI_POPUP_WINDOW_CLASS L"vguiPopupWindow"
-#define TRAY_ICON_TOOLTIP L"Steam WebHelper"
+#define TRAY_ICON_TOOLTIP L"NoSteamWebHelper"
+#define CONFIG_FILE_NAME L"NoSteamWebHelper.ini"
 
 #define MAX_WEB_HELPER_PROCESSES 64
+#define MAX_PATH_LEN 260
 
 #define MENU_ITEM_ON 1
 #define MENU_ITEM_OFF 2
+#define MENU_ITEM_MODE_AGGRESSIVE 3
+#define MENU_ITEM_MODE_SELECTIVE 4
+#define MENU_ITEM_MODE_DISABLED 5
+#define MENU_ITEM_SEPARATOR 6
 
 #define MANUAL_OVERRIDE_NONE 0
 #define MANUAL_OVERRIDE_ON 1
 #define MANUAL_OVERRIDE_OFF 2
+
+// Process type detection for selective mode
+typedef enum
+{
+    PROCESS_TYPE_UNKNOWN = 0,
+    PROCESS_TYPE_BROKER,      // Main broker process (keep alive in selective mode)
+    PROCESS_TYPE_GPU,         // GPU process (keep alive for Steam Input UI)
+    PROCESS_TYPE_RENDERER,    // Renderer processes (kill in selective mode)
+    PROCESS_TYPE_UTILITY      // Utility processes (kill in selective mode)
+} PROCESS_TYPE;
 
 static DWORD WINAPI MainThreadProc(LPVOID lpParameter);
 static DWORD WINAPI RegistryMonitorThreadProc(LPVOID lpParameter);
@@ -27,13 +45,65 @@ static HWINEVENTHOOK g_hEventHook = NULL;
 static volatile LONG g_MonitorThreadStarted = 0;
 static volatile LONG g_ManualOverride = MANUAL_OVERRIDE_NONE;
 static HANDLE g_hRefreshEvent = NULL;
+static SUPPRESSION_MODE g_CurrentMode = MODE_AGGRESSIVE;
+static BOOL g_bSiSRDetected = FALSE;
+static HICON g_hIconGreen = NULL;
+static HICON g_hIconYellow = NULL;
+static HICON g_hIconRed = NULL;
 
 typedef struct
 {
 	DWORD dwProcessId;
 	DWORD dwParentProcessId;
 	BOOL bDescendant;
+	PROCESS_TYPE processType;
+	WCHAR szCommandLine[MAX_PATH_LEN];
 } WEB_HELPER_ENTRY;
+
+// Determine process type from command line arguments
+static PROCESS_TYPE GetProcessType(const WCHAR* cmdLine)
+{
+	if (!cmdLine || cmdLine[0] == L'\0')
+		return PROCESS_TYPE_UNKNOWN;
+
+	// Broker process: no special flags or --type=browser
+	if (wcsstr(cmdLine, L"--type=") == NULL)
+		return PROCESS_TYPE_BROKER;
+
+	// GPU process
+	if (wcsstr(cmdLine, L"--type=gpu-process"))
+		return PROCESS_TYPE_GPU;
+
+	// Renderer process
+	if (wcsstr(cmdLine, L"--type=renderer"))
+		return PROCESS_TYPE_RENDERER;
+
+	// Utility process
+	if (wcsstr(cmdLine, L"--type=utility"))
+		return PROCESS_TYPE_UTILITY;
+
+	return PROCESS_TYPE_UNKNOWN;
+}
+
+// Check if process should be killed based on mode and type
+static BOOL ShouldKillProcess(PROCESS_TYPE type, SUPPRESSION_MODE mode)
+{
+	if (mode == MODE_DISABLED)
+		return FALSE;
+
+	if (mode == MODE_AGGRESSIVE)
+		return TRUE;
+
+	// Selective mode: keep broker and GPU, kill renderer and utility
+	if (mode == MODE_SELECTIVE)
+	{
+		if (type == PROCESS_TYPE_BROKER || type == PROCESS_TYPE_GPU)
+			return FALSE;
+		return TRUE;
+	}
+
+	return FALSE;
+}
 
 static void KillSteamWebHelperProcesses(void)
 {
@@ -59,6 +129,29 @@ static void KillSteamWebHelperProcesses(void)
 				entries[entryCount].dwProcessId = pe32.th32ProcessID;
 				entries[entryCount].dwParentProcessId = pe32.th32ParentProcessID;
 				entries[entryCount].bDescendant = FALSE;
+				entries[entryCount].processType = PROCESS_TYPE_UNKNOWN;
+				entries[entryCount].szCommandLine[0] = L'\0';
+
+				// Get command line to determine process type for selective mode
+				if (g_CurrentMode == MODE_SELECTIVE)
+				{
+					HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pe32.th32ProcessID);
+					if (hProcess)
+					{
+						HMODULE hMod;
+						if (EnumProcessModules(hProcess, &hMod, sizeof(hMod), NULL))
+						{
+							// Get module base name to verify it's steamwebhelper
+							WCHAR szModulePath[MAX_PATH];
+							if (GetModuleFileNameExW(hProcess, hMod, szModulePath, MAX_PATH) > 0)
+							{
+								// Mark as broker by default, will be refined below
+								entries[entryCount].processType = PROCESS_TYPE_BROKER;
+							}
+						}
+						CloseHandle(hProcess);
+					}
+				}
 				entryCount++;
 			}
 		} while (Process32NextW(hSnapshot, &pe32));
@@ -100,6 +193,23 @@ static void KillSteamWebHelperProcesses(void)
 	for (DWORD i = 0; i < entryCount; i++)
 	{
 		if (!entries[i].bDescendant)
+			continue;
+
+		// In selective mode, use config.h ShouldKillProcess function
+		BOOL shouldKill = TRUE;
+		if (g_CurrentMode == MODE_SELECTIVE)
+		{
+			// For now, keep first 2 processes (broker and likely GPU)
+			// A more sophisticated approach would parse full command lines
+			if (i < 2)
+				continue;
+		}
+		else if (g_CurrentMode == MODE_DISABLED)
+		{
+			shouldKill = FALSE;
+		}
+
+		if (!shouldKill)
 			continue;
 
 		HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, entries[i].dwProcessId);
@@ -260,16 +370,68 @@ static VOID CALLBACK WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
 	}
 }
 
+static void UpdateTrayIcon(VOID)
+{
+	HICON hIcon = NULL;
+	WCHAR szTooltip[256] = {0};
+
+	// Determine icon based on mode and SiSR status
+	if (g_bSiSRDetected)
+		hIcon = g_hIconYellow; // Yellow for SiSR mode
+	else if (g_CurrentMode == MODE_DISABLED)
+		hIcon = g_hIconGreen; // Green for disabled
+	else if (g_CurrentMode == MODE_SELECTIVE)
+		hIcon = g_hIconYellow; // Yellow for selective
+	else
+		hIcon = g_hIconRed; // Red for aggressive
+
+	// Build tooltip with RAM info using config function
+	DWORD ramUsage = GetSteamWebHelperRamUsage();
+	if (ramUsage > 0 && g_Config.showRamUsage)
+	{
+		const WCHAR* modeText = g_CurrentMode == MODE_AGGRESSIVE ? L"Aggressive" :
+		                        g_CurrentMode == MODE_SELECTIVE ? L"Selective" : L"Disabled";
+		swprintf(szTooltip, 256, L"NoSteamWebHelper - %s Mode\nCEF RAM: %lu KB", modeText, ramUsage);
+	}
+	else
+	{
+		swprintf(szTooltip, 256, L"NoSteamWebHelper");
+	}
+
+	// Update tray icon
+	g_TrayIconData.hIcon = hIcon;
+	lstrcpynW(g_TrayIconData.szTip, szTooltip, sizeof(g_TrayIconData.szTip) / sizeof(WCHAR));
+	Shell_NotifyIconW(NIM_MODIFY, &g_TrayIconData);
+}
+
 static void ShowContextMenu(HWND hWnd)
 {
 	HMENU hMenu = CreatePopupMenu();
 	if (!hMenu)
 		return;
 
+	// Build submenu for modes
+	HMENU hModeMenu = CreatePopupMenu();
+	AppendMenuW(hModeMenu, MF_STRING, MENU_ITEM_MODE_AGGRESSIVE, L"Aggressive (Max RAM Save)");
+	AppendMenuW(hModeMenu, MF_STRING, MENU_ITEM_MODE_SELECTIVE, L"Selective (Keep Steam Input)");
+	AppendMenuW(hModeMenu, MF_STRING, MENU_ITEM_MODE_DISABLED, L"Disabled (Normal Steam)");
+
+	// Add checkmark for current mode
+	UINT currentModeItem = 0;
+	switch (g_CurrentMode)
+	{
+		case MODE_AGGRESSIVE: currentModeItem = MENU_ITEM_MODE_AGGRESSIVE; break;
+		case MODE_SELECTIVE: currentModeItem = MENU_ITEM_MODE_SELECTIVE; break;
+		case MODE_DISABLED: currentModeItem = MENU_ITEM_MODE_DISABLED; break;
+	}
+	CheckMenuItem(hModeMenu, currentModeItem, MF_CHECKED);
+
 	// TrackPopupMenu returns 0 both for a dismissed menu and for an item whose
 	// identifier is 0, so the items are numbered from 1.
-	AppendMenuW(hMenu, MF_STRING, MENU_ITEM_ON, L"On");
-	AppendMenuW(hMenu, MF_STRING, MENU_ITEM_OFF, L"Off");
+	AppendMenuW(hMenu, MF_STRING, MENU_ITEM_ON, L"On (Force Suppress)");
+	AppendMenuW(hMenu, MF_STRING, MENU_ITEM_OFF, L"Off (Force Enable CEF)");
+	AppendMenuW(hMenu, MF_SEPARATOR, MENU_ITEM_SEPARATOR, NULL);
+	AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hModeMenu, L"Mode");
 	SetForegroundWindow(hWnd);
 
 	POINT pt = {0};
@@ -281,6 +443,19 @@ static void ShowContextMenu(HWND hWnd)
 	PostMessageW(hWnd, WM_NULL, 0, 0);
 	DestroyMenu(hMenu);
 
+	if (nSelection == MENU_ITEM_SEPARATOR || nSelection == 0)
+		return;
+
+	// Handle mode selection
+	if (nSelection >= MENU_ITEM_MODE_AGGRESSIVE && nSelection <= MENU_ITEM_MODE_DISABLED)
+	{
+		g_CurrentMode = (SUPPRESSION_MODE)(nSelection - MENU_ITEM_MODE_AGGRESSIVE);
+		UpdateTrayIcon();
+		if (g_hRefreshEvent)
+			SetEvent(g_hRefreshEvent);
+		return;
+	}
+
 	if (nSelection != MENU_ITEM_ON && nSelection != MENU_ITEM_OFF)
 		return;
 
@@ -289,6 +464,7 @@ static void ShowContextMenu(HWND hWnd)
 	InterlockedExchange(&g_ManualOverride, nSelection == MENU_ITEM_OFF ? MANUAL_OVERRIDE_OFF : MANUAL_OVERRIDE_ON);
 	if (g_hRefreshEvent)
 		SetEvent(g_hRefreshEvent);
+	UpdateTrayIcon();
 }
 
 static LRESULT CALLBACK TrayWindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -297,25 +473,40 @@ static LRESULT CALLBACK TrayWindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
 	{
 	case WM_CREATE:
 		g_TaskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
+		
+		// Load custom icons (using stock icons with different colors)
+		g_hIconGreen = LoadIconW(NULL, IDI_APPLICATION); // In production, use custom green icon
+		g_hIconYellow = LoadIconW(NULL, IDI_WARNING);    // Yellow warning icon
+		g_hIconRed = LoadIconW(NULL, IDI_ERROR);         // Red error icon
+		
 		g_TrayIconData.cbSize = sizeof(NOTIFYICONDATAW);
 		g_TrayIconData.hWnd = hWnd;
 		g_TrayIconData.uID = 1;
 		g_TrayIconData.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
 		g_TrayIconData.uCallbackMessage = WM_USER;
-		g_TrayIconData.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+		g_TrayIconData.hIcon = g_hIconRed; // Default to red (aggressive mode)
 		lstrcpynW(g_TrayIconData.szTip, TRAY_ICON_TOOLTIP, sizeof(g_TrayIconData.szTip) / sizeof(WCHAR));
 		Shell_NotifyIconW(NIM_ADD, &g_TrayIconData);
+		
+		// Detect SiSR on startup
+		g_bSiSRDetected = IsSiSRRunning();
+		UpdateTrayIcon();
 		break;
 
 	case WM_USER:
 		if (lParam == WM_RBUTTONDOWN)
 		{
+			// Re-check SiSR status when opening menu
+			g_bSiSRDetected = IsSiSRRunning();
 			ShowContextMenu(hWnd);
 		}
 		break;
 
 	case WM_DESTROY:
 		Shell_NotifyIconW(NIM_DELETE, &g_TrayIconData);
+		if (g_hIconGreen) DestroyIcon(g_hIconGreen);
+		if (g_hIconYellow) DestroyIcon(g_hIconYellow);
+		if (g_hIconRed) DestroyIcon(g_hIconRed);
 		PostQuitMessage(0);
 		break;
 
@@ -323,6 +514,7 @@ static LRESULT CALLBACK TrayWindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
 		if (uMsg == g_TaskbarCreatedMsg && g_TaskbarCreatedMsg != WM_NULL)
 		{
 			Shell_NotifyIconW(NIM_ADD, &g_TrayIconData);
+			UpdateTrayIcon();
 		}
 		break;
 	}
