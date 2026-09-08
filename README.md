@@ -45,18 +45,43 @@ Automatic detection of **SISR (Steam Input System Redirector)** and **ViGEmBus**
 - When detected, tray icon turns yellow to indicate headless mode
 - Optimized for users running Steam purely for input remapping
 - Perfect for non-Steam games using controller rerouting
+- **What SISR hooks from Steam**: Uses Steam's native input APIs (not CEF-dependent)
+  - Steam Input configuration system
+  - Virtual device interfaces (ViGEmBus/viiper)
+  - Controller mapping and action sets
+  - All work without CEF processes
+
+### Non-Steam Game Scenarios
+1. **Direct Steam Input**: Add non-Steam game to Steam library → Steam Input works natively
+2. **SISR/ViGEmBus Route**: Steam runs in background → SISR redirects input to any game
+3. **Glossi Alternative**: Similar approach using different virtual device layer
+
+In all scenarios, Steam Input configuration requires CEF only briefly during setup, not during gameplay.
 
 ## Usage
-1. Download the latest release from [GitHub Releases](https://github.com/etil2jz/NoSteamWebHelper/releases/latest).
+1. Download the latest release from [GitHub Releases](https://github.com/oraphiio/NoSteamWebHelper/releases/latest).
 2. Place `umpdc.dll` in your Steam installation directory (same folder as `steam.exe`).
 3. Ensure Steam is fully closed, then launch Steam.
 4. The CEF will now toggle automatically when you launch/close a game.
+
+### Mid-Game CEF Toggle
+Need to access Steam settings during gameplay?
+- Right-click tray icon → Select "Off (Force Enable CEF)"
+- Make your changes (controller config, settings, etc.)
+- Select "On (Force Suppress)" or close the game to re-enable suppression
 
 > [!TIP]
 > - **Tray Icon Colors**: Red (Aggressive), Yellow (Selective/SISR), Green (Disabled)
 > - **Right-click tray icon** to change modes or manually toggle CEF
 > - **RAM Usage**: Hover over tray icon to see current CEF memory consumption
 > - Launch Steam with `-silent` to prevent the CEF from popping up unexpectedly when restored.
+> - **Selective Mode**: Keeps Steam Input UI accessible while killing renderer processes
+> - **SISR Users**: Automatic detection enables optimal headless mode for input-only usage
+
+### Configuration File Location
+The configuration file is stored at:
+- **Windows**: `%APPDATA%\NoSteamWebHelper\NoSteamWebHelper.ini`
+- Typically: `C:\Users\<YourUsername>\AppData\Roaming\NoSteamWebHelper\NoSteamWebHelper.ini`
 
 ## Configuration
 Create `%APPDATA%\NoSteamWebHelper\NoSteamWebHelper.ini` to customize behavior:
@@ -69,6 +94,11 @@ ShowRamUsage=1            ; Display RAM usage in tooltip
 AutoDetectSiSR=1          ; Auto-detect SISR/ViGEmBus
 ```
 
+### Mode Descriptions
+- **Mode=0 (Aggressive)**: Kill ALL steamwebhelper processes - maximum RAM savings
+- **Mode=1 (Selective)**: Keep broker + GPU processes, kill renderers - balanced approach
+- **Mode=2 (Disabled)**: No intervention - normal Steam behavior
+
 > [!NOTE]
 > **Steam Input does NOT require CEF** - it uses native Steam processes.
 > CEF is only needed for:
@@ -76,6 +106,13 @@ AutoDetectSiSR=1          ; Auto-detect SISR/ViGEmBus
 > - Steam Browser (store, community, profiles)
 > - Steam Chat window
 > - Web-based store pages
+> - **Brief configuration changes** - once config is saved, CEF can be killed again
+
+### What Processes Are Kept in Selective Mode?
+- ✅ **Broker process** (no `--type` flag) - main Steam Input coordinator
+- ✅ **GPU process** (`--type=gpu-process`) - hardware acceleration for input UI
+- ❌ **Renderer processes** (`--type=renderer`) - web content rendering (killed)
+- ❌ **Utility processes** (`--type=utility`) - background tasks (killed)
 
 ## Build from Source
 The project uses **MSYS2** with the **UCRT64** environment.
