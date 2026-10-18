@@ -1,0 +1,15 @@
+[build]
+target = "x86_64-pc-windows-gnullvm"
+
+[target.x86_64-pc-windows-gnullvm]
+linker = "clang"
+# The DLL runs on other people's machines: a target-cpu=native inherited from
+# a user-wide config must not leak into it. Setting the target's rustflags
+# makes Cargo ignore build.rustflags altogether.
+rustflags = ["-C", "target-cpu=x86-64"]
+
+# Config profiles take precedence over the manifest's, so a user-wide
+# strip = "debuginfo" is overridden here: stripping is done by the linker,
+# see build.rs.
+[profile.release]
+strip = "none"

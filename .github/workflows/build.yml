@@ -1,0 +1,85 @@
+name: Build
+
+# Called by release.yml, which decides what the token may do: the steps that
+# need write access only run for a tag, where the caller grants it.
+on:
+  workflow_call:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      DLL: target/x86_64-pc-windows-gnullvm/release/umpdc.dll
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Check tag matches version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+      # The gnullvm target links through MSYS2's CLANG64 clang, which also
+      # brings lld, the MinGW import libraries and llvm-objdump.
+      - name: Setup MSYS2
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: mingw-w64-clang-x86_64-clang
+
+      - name: Add CLANG64 to PATH
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH "${{ steps.msys2.outputs.msys2-location }}\clang64\bin"
+
+      # rustup installs the toolchain, target and components pinned in
+      # rust-toolchain.toml on first use.
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --release --locked -- -D warnings
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # The panic handler is the only caller of ExitThread, so its import
+      # betrays a panic path that survived optimization; any DLL outside the
+      # system ones means some routine fell back on a runtime library.
+      - name: Check imports
+        shell: bash
+        run: |
+          imports=$(llvm-objdump -p "$DLL")
+          unexpected=$(grep 'DLL Name:' <<< "$imports" | awk '{ print tolower($3) }' \
+            | grep -vxE '(kernel32|user32|gdi32|advapi32|shell32)\.dll' || true)
+          if [ -n "$unexpected" ] || grep -q 'ExitThread' <<< "$imports"; then
+            echo "$imports"
+            exit 1
+          fi
+
+      - name: Attest Build Provenance
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ env.DLL }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: umpdc-dll
+          path: ${{ env.DLL }}
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ env.DLL }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
